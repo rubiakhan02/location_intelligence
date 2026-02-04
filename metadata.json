@@ -1,0 +1,7 @@
+{
+  "name": "RealEstate MPF Intelligence",
+  "description": "A professional location intelligence platform for real estate market potential analysis, featuring AI-driven scoring and infrastructure insights.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}
