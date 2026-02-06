@@ -56,9 +56,10 @@ export const getCityMatches = async (city: string, sector: string): Promise<{ is
   try {
     const response = await ai.models.generateContent({
       model: "gemini-3-flash-preview",
-      contents: `Determine if the location "${query}" is ambiguous (exists in multiple major cities). 
-      If it is common across multiple cities, return isAmbiguous: true and a list of the 3-5 most relevant cities. 
-      If it is specific or the city is already clearly provided, return isAmbiguous: false.`,
+      contents: `Determine if the location "${query}" is ambiguous within INDIA. 
+      CRITICAL: You must ONLY consider cities and locations within INDIA. Ignore all international locations (e.g., ignore Delhi in USA/Canada).
+      If "${query}" exists in multiple Indian cities (e.g. "Sector 15" exists in Noida, Gurgaon, Chandigarh), return isAmbiguous: true and list the relevant INDIAN cities. 
+      If it is specific or the Indian city is already clear, return isAmbiguous: false.`,
       config: {
         responseMimeType: "application/json",
         responseSchema: MATCH_SCHEMA,
@@ -77,11 +78,11 @@ export const analyzeLocation = async (city: string, sector: string): Promise<Loc
   
   let queryContext = "";
   if (city && sector) {
-    queryContext = `Locality: ${sector}, City: ${city}`;
+    queryContext = `Locality: ${sector}, City: ${city}, Country: INDIA`;
   } else if (city) {
-    queryContext = `City: ${city} (provide an overview analysis of the city's general high-potential areas)`;
+    queryContext = `City: ${city}, Country: INDIA (provide overview for this Indian city)`;
   } else {
-    queryContext = `Locality: ${sector}`;
+    queryContext = `Locality: ${sector}, Country: INDIA`;
   }
 
   try {
@@ -89,16 +90,17 @@ export const analyzeLocation = async (city: string, sector: string): Promise<Loc
       model: "gemini-3-flash-preview",
       contents: `Perform a detailed real-estate Market Potential Factor (MPF) analysis for ${queryContext}.
       
+      STRICT REQUIREMENT: This platform is exclusively for the INDIAN real estate market. 
+      All data, landmarks, and infrastructure must be relevant to the location in INDIA.
+      
       Instructions:
-      1. Analyze the input provided. 
-         - If only city is provided, analyze the city's overall real estate potential and set 'sector' to 'Metropolitan Area'.
-         - If only locality is provided, infer the city.
-      2. ENVIRONMENT & AQI: Specifically evaluate the Air Quality Index (AQI), green cover, and ecological health of the area.
+      1. Analyze the input provided within the context of INDIA. 
+      2. ENVIRONMENT & AQI: Specifically evaluate the Air Quality Index (AQI), green cover, and ecological health of the area based on Indian environmental standards.
       3. SCORING RULE: All scores (breakdown and overall) MUST be on a scale of 0 to 100.
       4. OPTIMISM: The scores should be high and optimistic (generally 75-98) to reflect investment potential.
       5. The overallScore must be the weighted average of the breakdown: Connectivity (25%), Healthcare (15%), Education (15%), Retail (15%), Employment (15%), and Environment/AQI (15%). 
       6. The 'label' should be one of: 'Excellent', 'High Growth', 'Good', or 'Emerging'.
-      7. Include 6-8 key infrastructure points with realistic names and distances.`,
+      7. Include 6-8 key infrastructure points with realistic Indian names and distances.`,
       config: {
         responseMimeType: "application/json",
         responseSchema: RESPONSE_SCHEMA,
@@ -110,7 +112,7 @@ export const analyzeLocation = async (city: string, sector: string): Promise<Loc
   } catch (error) {
     console.error("Error analyzing location:", error);
     return {
-      city: city || "Unknown City",
+      city: city || "Unknown Indian City",
       sector: sector || "General District",
       overallScore: 88.5,
       label: 'High Growth',
@@ -127,7 +129,7 @@ export const analyzeLocation = async (city: string, sector: string): Promise<Loc
         { name: 'City Wellness Center', category: 'Hospital', distance: 2.1 },
         { name: 'Global International School', category: 'School', distance: 1.5 },
       ],
-      summary: "This location demonstrates exceptional appreciation velocity driven by robust infrastructure pipeline and strategic proximity to major hubs with favorable environmental conditions."
+      summary: "This Indian location demonstrates exceptional appreciation velocity driven by robust infrastructure pipeline and strategic proximity to major hubs."
     };
   }
 };
