@@ -13,12 +13,14 @@ export const Hero: React.FC<HeroProps> = ({ onAnalyze, isLoading }) => {
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (sector.trim() || city.trim()) {
+    // Logic updated to require BOTH city and sector
+    if (sector.trim() && city.trim()) {
       onAnalyze(city.trim(), sector.trim());
     }
   };
 
-  const isButtonDisabled = isLoading || (!sector.trim() && !city.trim());
+  // Button is disabled if loading OR if either field is empty
+  const isButtonDisabled = isLoading || !sector.trim() || !city.trim();
 
   return (
     <section id="home" className="pt-32 pb-10 px-4">
@@ -39,6 +41,7 @@ export const Hero: React.FC<HeroProps> = ({ onAnalyze, isLoading }) => {
               className="w-full px-4 py-3.5 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all"
               value={city}
               onChange={(e) => setCity(e.target.value)}
+              required
             />
           </div>
           <div className="w-full relative">
@@ -49,6 +52,7 @@ export const Hero: React.FC<HeroProps> = ({ onAnalyze, isLoading }) => {
               className="w-full px-4 py-3.5 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all"
               value={sector}
               onChange={(e) => setSector(e.target.value)}
+              required
             />
           </div>
           <button 
