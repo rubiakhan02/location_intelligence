@@ -9,12 +9,13 @@ import { DemoMap } from '../components/DemoMap';
 import { HowItWorks, UseCases } from '../components/Features';
 import { Footer } from '../components/Footer';
 import { LocationAnalysis } from '../types';
-import { analyzeLocation, getCityMatches } from '../services/locationService';
+import { analyzeLocation, getCityMatches, validateLocationInput } from '../services/locationService';
 
 export default function Home() {
   const [loading, setLoading] = useState(false);
   const [analysis, setAnalysis] = useState<LocationAnalysis | null>(null);
   const [ambiguousCities, setAmbiguousCities] = useState<string[] | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [lastQuery, setLastQuery] = useState<{ city: string; sector: string } | null>(null);
   const resultsRef = useRef<HTMLDivElement>(null);
 
@@ -22,9 +23,17 @@ export default function Home() {
     setLoading(true);
     setAmbiguousCities(null);
     setAnalysis(null);
+    setErrorMessage(null);
     setLastQuery({ city, sector });
 
     try {
+      const validation = await validateLocationInput(city, sector);
+      if (!validation.isValid) {
+        setErrorMessage(validation.reason || 'Invalid input. Enter a valid city and locality.');
+        setLoading(false);
+        return;
+      }
+
       // Step 1: Detect ambiguity
       const { isAmbiguous, suggestedCities } = await getCityMatches(city, sector);
 
@@ -42,6 +51,7 @@ export default function Home() {
       }, 100);
     } catch (error) {
       console.error("Failed to analyze location", error);
+      setErrorMessage('Unable to process input right now. Try again.');
     } finally {
       setLoading(false);
     }
@@ -75,6 +85,13 @@ export default function Home() {
       
       <main className="max-w-7xl mx-auto">
         <Hero onAnalyze={handleAnalyze} isLoading={loading} />
+        {errorMessage && (
+          <div className="max-w-4xl mx-auto px-4 pt-4">
+            <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-semibold text-red-700">
+              {errorMessage}
+            </div>
+          </div>
+        )}
 
         {/* Ambiguity Confirmation Prompt */}
         {ambiguousCities && !loading && (

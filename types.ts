@@ -5,7 +5,6 @@ export interface ScoreBreakdown {
   education: number;
   retail: number;
   employment: number;
-  environment: number;
 }
 
 export interface InfrastructureItem {

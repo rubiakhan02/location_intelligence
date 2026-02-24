@@ -81,13 +81,13 @@ export const ScoreDisplay: React.FC<ScoreDisplayProps> = ({ data }) => {
         <BreakdownCard label="Education" score={data.breakdown.education} icon="🏫" color="bg-indigo-600" />
         <BreakdownCard label="Retail & Lifestyle" score={data.breakdown.retail} icon="🛍" color="bg-amber-500" />
         <BreakdownCard label="Employment" score={data.breakdown.employment} icon="🏢" color="bg-slate-700" />
-        <BreakdownCard label="Environment & AQI" score={data.breakdown.environment} icon="🍃" color="bg-emerald-500" />
+        {/* Environment/AQI removed */}
         
         {/* Market Composition Pie Chart */}
         <div className="bg-slate-900 text-white p-6 rounded-2xl border border-slate-800 shadow-xl sm:col-span-2 lg:col-span-3 flex items-center justify-between">
           <div className="max-w-[180px]">
             <h4 className="text-[10px] font-black opacity-50 mb-2 uppercase tracking-[0.2em]">Market Composition</h4>
-            <p className="text-[10px] text-slate-400 leading-tight">Weighted factor distribution across infrastructure pillars including real-time AQI index.</p>
+            <p className="text-[10px] text-slate-400 leading-tight">Weighted factor distribution across infrastructure pillars.</p>
           </div>
           <div className="flex items-center gap-6">
             <div className="relative">
@@ -102,7 +102,7 @@ export const ScoreDisplay: React.FC<ScoreDisplayProps> = ({ data }) => {
               <LegendItem label="Edu" color="bg-indigo-600" />
               <LegendItem label="Retail" color="bg-amber-500" />
               <LegendItem label="Job" color="bg-slate-700" />
-              <LegendItem label="Env" color="bg-emerald-500" />
+              {/* Env removed */}
             </div>
           </div>
         </div>
@@ -143,7 +143,7 @@ const PieChart: React.FC<{ breakdown: ScoreBreakdown }> = ({ breakdown }) => {
     { label: 'Education', value: breakdown.education, color: '#4f46e5' },
     { label: 'Retail', value: breakdown.retail, color: '#f59e0b' },
     { label: 'Employment', value: breakdown.employment, color: '#334155' },
-    { label: 'Environment', value: breakdown.environment, color: '#10b981' }
+    // Environment slice removed
   ];
 
   const total = data.reduce((acc, item) => acc + item.value, 0);

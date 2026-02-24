@@ -7,12 +7,13 @@ import { DemoMap } from './components/DemoMap';
 import { HowItWorks, UseCases } from './components/Features';
 import { Footer } from './components/Footer';
 import { LocationAnalysis } from './types';
-import { analyzeLocation, getCityMatches } from './services/locationService';
+import { analyzeLocation, getCityMatches, validateLocationInput } from './services/locationService';
 
 function App() {
   const [loading, setLoading] = useState(false);
   const [analysis, setAnalysis] = useState<LocationAnalysis | null>(null);
   const [ambiguousCities, setAmbiguousCities] = useState<string[] | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [lastQuery, setLastQuery] = useState<{ city: string; sector: string } | null>(null);
   const resultsRef = useRef<HTMLDivElement>(null);
 
@@ -20,9 +21,17 @@ function App() {
     setLoading(true);
     setAmbiguousCities(null);
     setAnalysis(null);
+    setErrorMessage(null);
     setLastQuery({ city, sector });
 
     try {
+      const validation = await validateLocationInput(city, sector);
+      if (!validation.isValid) {
+        setErrorMessage(validation.reason || 'Invalid input. Enter a valid city and locality.');
+        setLoading(false);
+        return;
+      }
+
       // First, check for ambiguity
       const { isAmbiguous, suggestedCities } = await getCityMatches(city, sector);
 
@@ -40,6 +49,7 @@ function App() {
       }, 100);
     } catch (error) {
       console.error("Failed to analyze location", error);
+      setErrorMessage('Unable to process input right now. Try again.');
     } finally {
       setLoading(false);
     }
@@ -85,6 +95,13 @@ function App() {
       
       <main className="max-w-7xl mx-auto">
         <Hero onAnalyze={handleAnalyze} isLoading={loading} />
+        {errorMessage && (
+          <div className="max-w-4xl mx-auto px-4 pt-4">
+            <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-semibold text-red-700">
+              {errorMessage}
+            </div>
+          </div>
+        )}
 
         {/* City Disambiguation UI */}
         {ambiguousCities && !loading && (
