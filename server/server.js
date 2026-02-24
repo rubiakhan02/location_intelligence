@@ -1,7 +1,14 @@
-import express from 'express';
-import cors from 'cors';
-import crypto from 'crypto';
-import { GoogleGenAI } from '@google/genai';
+import express from "express";
+import cors from "cors";
+import crypto from "crypto";
+import dotenv from "dotenv";
+import path from "path";
+import { fileURLToPath } from "url";
+import { GoogleGenAI, Type } from "@google/genai";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+dotenv.config({ path: path.resolve(__dirname, "../.env") });
 
 const app = express();
 app.use(cors());
@@ -9,161 +16,378 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 4000;
 const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
-let ai = null;
-if (apiKey) {
-  ai = new GoogleGenAI({ apiKey });
-  console.log('GoogleGenAI initialized');
+const ai = apiKey ? new GoogleGenAI({ apiKey }) : null;
+
+if (ai) {
+  console.log("GoogleGenAI initialized");
 } else {
-  console.log('No API key provided; running with fallback responses');
+  console.log("No API key provided; running with fallback responses");
 }
 
-const store = new Map();
-const inputKeyMap = new Map(); // maps deterministic input key -> id
-const resultCache = new Map(); // maps id -> fully computed result (prevents re-computation)
+const store = new Map(); // id -> request state
+const inputKeyMap = new Map(); // normalized input key -> id
 
-app.get('/api/ping', (req, res) => {
-  res.json({ ok: true, message: 'pong' });
+const RESPONSE_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    city: { type: Type.STRING },
+    sector: { type: Type.STRING },
+    overallScore: { type: Type.NUMBER },
+    label: { type: Type.STRING },
+    breakdown: {
+      type: Type.OBJECT,
+      properties: {
+        connectivity: { type: Type.NUMBER },
+        healthcare: { type: Type.NUMBER },
+        education: { type: Type.NUMBER },
+        retail: { type: Type.NUMBER },
+        employment: { type: Type.NUMBER },
+      },
+      required: ["connectivity", "healthcare", "education", "retail", "employment"],
+    },
+    infrastructure: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          name: { type: Type.STRING },
+          category: { type: Type.STRING },
+          distance: { type: Type.NUMBER },
+        },
+        required: ["name", "category", "distance"],
+      },
+    },
+    summary: { type: Type.STRING },
+  },
+  required: ["city", "sector", "overallScore", "label", "breakdown", "infrastructure", "summary"],
+};
+
+const MATCH_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    isAmbiguous: { type: Type.BOOLEAN },
+    suggestedCities: { type: Type.ARRAY, items: { type: Type.STRING } },
+  },
+  required: ["isAmbiguous", "suggestedCities"],
+};
+
+const VALIDATION_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    isValid: { type: Type.BOOLEAN },
+    reason: { type: Type.STRING },
+  },
+  required: ["isValid", "reason"],
+};
+
+const normalize = (value) => (value || "").trim();
+const getInputKey = (city, sector) =>
+  `${normalize(city).toLowerCase()}::${normalize(sector).toLowerCase()}`;
+
+const stableSeed = (input) => {
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+};
+
+const clampScore = (value) => Math.max(0, Math.min(100, Number(value) || 0));
+
+const isObviouslyGibberish = (value) => {
+  const text = normalize(value);
+  if (!text || text.length < 2) return true;
+  if (/[0-9]{5,}/.test(text)) return true;
+  if (/[^a-zA-Z0-9\s,.'-]/.test(text)) return true;
+  if (/([a-zA-Z])\1{3,}/.test(text)) return true;
+
+  const letters = text.replace(/[^a-zA-Z]/g, "");
+  if (letters.length < 2) return true;
+  if (!/[aeiouAEIOU]/.test(letters) && letters.length > 4) return true;
+
+  return false;
+};
+
+const fallbackAnalysis = (city, sector) => ({
+  city: city || "Unknown Indian City",
+  sector: sector || "General District",
+  overallScore: 88.5,
+  label: "High Growth",
+  breakdown: {
+    connectivity: 92,
+    healthcare: 85,
+    education: 88,
+    retail: 82,
+    employment: 90,
+  },
+  infrastructure: [
+    { name: "Express Link Metro", category: "Metro", distance: 0.8 },
+    { name: "City Wellness Center", category: "Hospital", distance: 2.1 },
+    { name: "Global International School", category: "School", distance: 1.5 },
+  ],
+  summary:
+    "This Indian location demonstrates exceptional appreciation velocity driven by robust infrastructure pipeline and strategic proximity to major hubs.",
 });
 
-app.post('/api/analyze', (req, res) => {
-  const { city, sector } = req.body || {};
+const computeLabel = (overallScore) => {
+  if (overallScore >= 90) return "Excellent";
+  if (overallScore >= 82) return "High Growth";
+  if (overallScore >= 74) return "Good";
+  return "Emerging";
+};
 
-  const result = {
-    city: city || 'Unknown Indian City',
-    sector: sector || 'General District',
-    overallScore: 88.5,
-    label: 'High Growth',
-    breakdown: {
-      connectivity: 92,
-      healthcare: 85,
-      education: 88,
-      retail: 82,
-      employment: 90,
-    },
-    infrastructure: [
-      { name: 'Express Link Metro', category: 'Metro', distance: 0.8 },
-      { name: 'City Wellness Center', category: 'Hospital', distance: 2.1 },
-      { name: 'Global International School', category: 'School', distance: 1.5 },
-    ],
-    summary:
-      'This Indian location demonstrates exceptional appreciation velocity driven by robust infrastructure pipeline and strategic proximity to major hubs.',
+const normalizeAnalysis = (raw, city, sector) => {
+  const breakdown = {
+    connectivity: Math.round(clampScore(raw?.breakdown?.connectivity ?? 0) * 10) / 10,
+    healthcare: Math.round(clampScore(raw?.breakdown?.healthcare ?? 0) * 10) / 10,
+    education: Math.round(clampScore(raw?.breakdown?.education ?? 0) * 10) / 10,
+    retail: Math.round(clampScore(raw?.breakdown?.retail ?? 0) * 10) / 10,
+    employment: Math.round(clampScore(raw?.breakdown?.employment ?? 0) * 10) / 10,
   };
 
-  res.json(result);
+  const overallScore =
+    Math.round(
+      clampScore(
+        breakdown.connectivity * 0.25 +
+          breakdown.healthcare * 0.15 +
+          breakdown.education * 0.15 +
+          breakdown.retail * 0.15 +
+          breakdown.employment * 0.15,
+      ) * 10,
+    ) / 10;
+
+  const infrastructure = (raw?.infrastructure || [])
+    .map((item) => ({
+      name: item?.name || "Unnamed Infrastructure",
+      category: item?.category || "Metro",
+      distance: Math.round(Math.max(0, Number(item?.distance) || 0) * 100) / 100,
+    }))
+    .sort((a, b) => a.distance - b.distance || a.name.localeCompare(b.name))
+    .slice(0, 8);
+
+  return {
+    city: raw?.city || city,
+    sector: raw?.sector || sector,
+    overallScore,
+    label: computeLabel(overallScore),
+    breakdown,
+    infrastructure,
+    summary:
+      raw?.summary ||
+      "This Indian location demonstrates strong appreciation potential driven by connectivity, services, and employment access.",
+  };
+};
+
+const validateInput = async (city, sector, key) => {
+  if (isObviouslyGibberish(city) || isObviouslyGibberish(sector)) {
+    return { isValid: false, reason: "Invalid input. Enter a valid city and locality." };
+  }
+
+  if (!ai) return { isValid: true, reason: "Validation skipped (no API key)." };
+
+  try {
+    const response = await ai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: `Validate this INDIA real-estate input.
+City: "${city}"
+Locality: "${sector}"
+Rules:
+1. Accept minor spelling mistakes and typos.
+2. Reject only clear gibberish/random/non-place input.
+3. Return JSON only.`,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: VALIDATION_SCHEMA,
+        temperature: 0,
+        topP: 0,
+        topK: 1,
+        candidateCount: 1,
+        seed: stableSeed(`validate::${key}`),
+      },
+    });
+
+    const parsed = JSON.parse(response.text || '{"isValid": true, "reason": "Valid input"}');
+    return {
+      isValid: Boolean(parsed.isValid),
+      reason: parsed.reason || (parsed.isValid ? "Valid input." : "Invalid input."),
+    };
+  } catch (error) {
+    console.error("Validation error:", error);
+    return { isValid: true, reason: "Validation unavailable, proceeding." };
+  }
+};
+
+const detectAmbiguity = async (city, sector, key) => {
+  if (!ai) return { isAmbiguous: false, suggestedCities: [] };
+
+  const query = `${sector} ${city}`.trim();
+  const response = await ai.models.generateContent({
+    model: "gemini-2.5-flash",
+    contents: `Determine if "${query}" is ambiguous within INDIA only.
+If this locality can refer to multiple Indian cities, return isAmbiguous true with suggestedCities.
+If specific enough, return isAmbiguous false.`,
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: MATCH_SCHEMA,
+      temperature: 0,
+      topP: 0,
+      topK: 1,
+      candidateCount: 1,
+      seed: stableSeed(`match::${key}`),
+    },
+  });
+
+  return JSON.parse(response.text || '{"isAmbiguous": false, "suggestedCities": []}');
+};
+
+const analyze = async (city, sector, key) => {
+  if (!ai) return fallbackAnalysis(city, sector);
+
+  const prompt = `Perform a detailed real-estate Market Potential Factor (MPF) analysis for Locality: ${sector}, City: ${city}, Country: INDIA.
+STRICT REQUIREMENT: only INDIA context.
+Scoring: 0-100 for connectivity, healthcare, education, retail, employment.
+Return JSON keys: city, sector, overallScore, label, breakdown, infrastructure, summary.`;
+
+  const response = await ai.models.generateContent({
+    model: "gemini-2.5-flash",
+    contents: prompt,
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: RESPONSE_SCHEMA,
+      temperature: 0,
+      topP: 0,
+      topK: 1,
+      candidateCount: 1,
+      seed: stableSeed(`analysis::${key}`),
+    },
+  });
+
+  const parsed = JSON.parse(response.text || "{}");
+  return normalizeAnalysis(parsed, city, sector);
+};
+
+const processRequest = async (item) => {
+  const key = getInputKey(item.city, item.sector);
+
+  const validation = await validateInput(item.city, item.sector, key);
+  if (!validation.isValid) {
+    return {
+      status: "invalid_input",
+      result: null,
+      error: validation.reason || "Invalid input. Enter a valid city and locality.",
+    };
+  }
+
+  const ambiguity = await detectAmbiguity(item.city, item.sector, key);
+  if (ambiguity.isAmbiguous && Array.isArray(ambiguity.suggestedCities) && ambiguity.suggestedCities.length > 1) {
+    return {
+      status: "needs_clarification",
+      result: null,
+      error: "Input is ambiguous. Please choose a city.",
+      suggestedCities: ambiguity.suggestedCities,
+    };
+  }
+
+  const result = await analyze(item.city, item.sector, key);
+  return { status: "done", result, error: null, suggestedCities: [] };
+};
+
+app.get("/api/ping", (req, res) => {
+  res.json({ ok: true, message: "pong" });
 });
 
-app.get('/', (req, res) => res.json({ message: 'API server running' }));
+app.get("/", (req, res) => {
+  res.json({
+    message: "API server running",
+    endpoints: ["POST /api/input", "GET /api/reply/:id"],
+  });
+});
 
-// Endpoint 1: receive input and return an id
-app.post('/input', (req, res) => {
-  const { city, sector } = req.body || {};
-  if (!city && !sector) return res.status(400).json({ error: 'Provide city or sector' });
-  const key = `${(city||'').trim().toLowerCase()}::${(sector||'').trim().toLowerCase()}`;
+// Endpoint 1: Accept city + locality and issue deterministic request id.
+app.post("/api/input", (req, res) => {
+  const city = normalize(req.body?.city);
+  const sector = normalize(req.body?.sector);
+
+  if (!city || !sector) {
+    return res.status(400).json({ error: "Both city and sector are required." });
+  }
+
+  const key = getInputKey(city, sector);
   if (inputKeyMap.has(key)) {
     const existingId = inputKeyMap.get(key);
-    return res.json({ id: existingId });
+    const existing = store.get(existingId);
+    return res.json({ id: existingId, status: existing?.status || "pending" });
   }
 
-  const id = crypto.createHash('sha256').update(key).digest('hex');
+  const id = crypto.createHash("sha256").update(key).digest("hex");
   inputKeyMap.set(key, id);
-  store.set(id, { city: city || null, sector: sector || null, status: 'pending', result: null });
-  res.json({ id });
+  store.set(id, {
+    id,
+    city,
+    sector,
+    status: "pending",
+    result: null,
+    error: null,
+    suggestedCities: [],
+  });
+
+  return res.json({ id, status: "pending" });
 });
 
-// Endpoint 2: produce (or return cached) reply for given id
-app.get('/reply/:id', async (req, res) => {
-  const id = req.params.id;
-  
-  // Check if result is already fully cached
-  if (resultCache.has(id)) {
-    return res.json({ id, result: resultCache.get(id) });
-  }
-  
+// Endpoint 2: Returns computed result for id (or computes once and caches it).
+app.get("/api/reply/:id", async (req, res) => {
+  const { id } = req.params;
   const item = store.get(id);
-  if (!item) return res.status(404).json({ error: 'id not found' });
-  if (item.result) {
-    // Cache it before returning
-    resultCache.set(id, item.result);
-    return res.json({ id, result: item.result });
+
+  if (!item) {
+    return res.status(404).json({ error: "id not found" });
+  }
+
+  if (item.status !== "pending") {
+    return res.json({
+      id,
+      status: item.status,
+      result: item.result,
+      error: item.error,
+      suggestedCities: item.suggestedCities || [],
+    });
   }
 
   try {
-    const { city, sector } = item;
-    let queryContext = '';
-    if (city && sector) queryContext = `Locality: ${sector}, City: ${city}, Country: INDIA`;
-    else if (city) queryContext = `City: ${city}, Country: INDIA`;
-    else queryContext = `Locality: ${sector}, Country: INDIA`;
+    const processed = await processRequest(item);
+    const updated = { ...item, ...processed };
+    store.set(id, updated);
 
-    const prompt = `Perform a detailed real-estate Market Potential Factor (MPF) analysis for ${queryContext}.\n\nSTRICT REQUIREMENT: This platform is exclusively for the INDIAN real estate market. All data, landmarks, and infrastructure must be relevant to the location in INDIA.\n\nReturn a JSON object with keys: city, sector, overallScore, label, breakdown, infrastructure, summary.`;
-
-    if (!ai) {
-      const fallback = {
-        city: city || 'Unknown Indian City',
-        sector: sector || 'General District',
-        overallScore: 88.5,
-        label: 'High Growth',
-        breakdown: {
-          connectivity: 92,
-          healthcare: 85,
-          education: 88,
-          retail: 82,
-          employment: 90,
-        },
-        infrastructure: [
-          { name: 'Express Link Metro', category: 'Metro', distance: 0.8 },
-          { name: 'City Wellness Center', category: 'Hospital', distance: 2.1 },
-          { name: 'Global International School', category: 'School', distance: 1.5 },
-        ],
-        summary: 'Fallback stub result for local testing.'
-      };
-
-      item.result = fallback;
-      item.status = 'done';
-      store.set(id, item);
-      resultCache.set(id, fallback);
-      return res.json({ id, result: fallback });
-    }
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt,
-      config: { responseMimeType: 'application/json', temperature: 0 }
+    return res.json({
+      id,
+      status: updated.status,
+      result: updated.result,
+      error: updated.error,
+      suggestedCities: updated.suggestedCities || [],
     });
-
-    const result = response?.text ? JSON.parse(response.text) : { raw: response };
-    item.result = result;
-    item.status = 'done';
-    store.set(id, item);
-    resultCache.set(id, result);
-    res.json({ id, result });
-  } catch (err) {
-    console.error('AI error', err);
-    // Fallback: return a stubbed result so local testing still works
-    const fallback = {
-      city: item.city || 'Unknown Indian City',
-      sector: item.sector || 'General District',
-      overallScore: 88.5,
-      label: 'High Growth',
-      breakdown: {
-        connectivity: 92,
-        healthcare: 85,
-        education: 88,
-        retail: 82,
-        employment: 90,
-      },
-      infrastructure: [
-        { name: 'Express Link Metro', category: 'Metro', distance: 0.8 },
-        { name: 'City Wellness Center', category: 'Hospital', distance: 2.1 },
-        { name: 'Global International School', category: 'School', distance: 1.5 },
-      ],
-      summary: 'Fallback stub result for local testing.'
+  } catch (error) {
+    console.error("Processing error:", error);
+    const fallback = fallbackAnalysis(item.city, item.sector);
+    const updated = {
+      ...item,
+      status: "done",
+      result: fallback,
+      error: "Model unavailable. Returned fallback response.",
+      suggestedCities: [],
     };
-    item.result = fallback;
-    item.status = 'done';
-    store.set(id, item);
-    resultCache.set(id, fallback);
-    res.json({ id, result: fallback });
+    store.set(id, updated);
+
+    return res.json({
+      id,
+      status: updated.status,
+      result: updated.result,
+      error: updated.error,
+      suggestedCities: updated.suggestedCities,
+    });
   }
 });
 
-app.listen(PORT, () => console.log(`API server listening on http://localhost:${PORT}`));
+app.listen(PORT, () => {
+  console.log(`API server listening on http://localhost:${PORT}`);
+});
