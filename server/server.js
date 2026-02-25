@@ -16,6 +16,13 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 4000;
 const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
+const MODEL_CANDIDATES = [
+  process.env.GEMINI_MODEL,
+  "gemini-flash-latest",
+  "gemini-2.5-flash",
+  "gemini-2.0-flash",
+  "gemini-1.5-flash-latest",
+].filter(Boolean);
 const ai = apiKey ? new GoogleGenAI({ apiKey }) : null;
 
 if (ai) {
@@ -90,10 +97,52 @@ const stableSeed = (input) => {
     hash ^= input.charCodeAt(i);
     hash = Math.imul(hash, 16777619);
   }
-  return hash >>> 0;
+  return (hash >>> 0) % 2147483647;
+};
+
+const generateContentWithModelFallback = async (buildRequest) => {
+  let lastError = null;
+
+  for (const model of MODEL_CANDIDATES) {
+    try {
+      return await ai.models.generateContent(buildRequest(model));
+    } catch (error) {
+      const message = String(error?.message || "");
+      const isModelNotFound = message.includes("not found") || message.includes("NOT_FOUND");
+      if (!isModelNotFound) {
+        throw error;
+      }
+      lastError = error;
+    }
+  }
+
+  throw lastError || new Error("No compatible Gemini model found.");
 };
 
 const clampScore = (value) => Math.max(0, Math.min(100, Number(value) || 0));
+const ACCURATE_LANDMARK_DATA_UNAVAILABLE =
+  "Accurate landmark data not available for this exact location.";
+
+const normalizeCategory = (value) => {
+  const v = (value || "").trim().toLowerCase();
+  if (v === "metro") return "Metro";
+  if (v === "hospital") return "Hospital";
+  if (v === "school") return "School";
+  if (v === "mall") return "Mall";
+  if (v === "park") return "Park";
+  return "Office";
+};
+
+const isGenericLandmarkName = (name) => {
+  const normalized = (name || "").trim().toLowerCase();
+  if (!normalized) return true;
+  return [
+    "express link metro",
+    "city wellness center",
+    "global international school",
+    "unnamed infrastructure",
+  ].includes(normalized);
+};
 
 const isObviouslyGibberish = (value) => {
   const text = normalize(value);
@@ -121,13 +170,8 @@ const fallbackAnalysis = (city, sector) => ({
     retail: 82,
     employment: 90,
   },
-  infrastructure: [
-    { name: "Express Link Metro", category: "Metro", distance: 0.8 },
-    { name: "City Wellness Center", category: "Hospital", distance: 2.1 },
-    { name: "Global International School", category: "School", distance: 1.5 },
-  ],
-  summary:
-    "This Indian location demonstrates exceptional appreciation velocity driven by robust infrastructure pipeline and strategic proximity to major hubs.",
+  infrastructure: [],
+  summary: ACCURATE_LANDMARK_DATA_UNAVAILABLE,
 });
 
 const computeLabel = (overallScore) => {
@@ -159,10 +203,11 @@ const normalizeAnalysis = (raw, city, sector) => {
 
   const infrastructure = (raw?.infrastructure || [])
     .map((item) => ({
-      name: item?.name || "Unnamed Infrastructure",
-      category: item?.category || "Metro",
+      name: (item?.name || "").trim(),
+      category: normalizeCategory(item?.category || ""),
       distance: Math.round(Math.max(0, Number(item?.distance) || 0) * 100) / 100,
     }))
+    .filter((item) => Boolean(item.name) && !isGenericLandmarkName(item.name))
     .sort((a, b) => a.distance - b.distance || a.name.localeCompare(b.name))
     .slice(0, 8);
 
@@ -174,8 +219,10 @@ const normalizeAnalysis = (raw, city, sector) => {
     breakdown,
     infrastructure,
     summary:
-      raw?.summary ||
-      "This Indian location demonstrates strong appreciation potential driven by connectivity, services, and employment access.",
+      infrastructure.length === 0
+        ? ACCURATE_LANDMARK_DATA_UNAVAILABLE
+        : (raw?.summary ||
+          "This Indian location demonstrates strong appreciation potential driven by connectivity, services, and employment access."),
   };
 };
 
@@ -187,8 +234,8 @@ const validateInput = async (city, sector, key) => {
   if (!ai) return { isValid: true, reason: "Validation skipped (no API key)." };
 
   try {
-    const response = await ai.models.generateContent({
-      model: "gemini-1.5-flash-latest",
+    const response = await generateContentWithModelFallback((model) => ({
+      model,
       contents: `Validate this INDIA real-estate input.
 City: "${city}"
 Locality: "${sector}"
@@ -205,7 +252,7 @@ Rules:
         candidateCount: 1,
         seed: stableSeed(`validate::${key}`),
       },
-    });
+    }));
 
     const parsed = JSON.parse(response.text || '{"isValid": true, "reason": "Valid input"}');
     return {
@@ -222,8 +269,8 @@ const detectAmbiguity = async (city, sector, key) => {
   if (!ai) return { isAmbiguous: false, suggestedCities: [] };
 
   const query = `${sector} ${city}`.trim();
-  const response = await ai.models.generateContent({
-    model: "gemini-1.5-flash-latest",
+  const response = await generateContentWithModelFallback((model) => ({
+    model,
     contents: `Determine if "${query}" is ambiguous within INDIA only.
 If this locality can refer to multiple Indian cities, return isAmbiguous true with suggestedCities.
 If specific enough, return isAmbiguous false.`,
@@ -236,7 +283,7 @@ If specific enough, return isAmbiguous false.`,
       candidateCount: 1,
       seed: stableSeed(`match::${key}`),
     },
-  });
+  }));
 
   return JSON.parse(response.text || '{"isAmbiguous": false, "suggestedCities": []}');
 };
@@ -249,8 +296,8 @@ STRICT REQUIREMENT: only INDIA context.
 Scoring: 0-100 for connectivity, healthcare, education, retail, employment.
 Return JSON keys: city, sector, overallScore, label, breakdown, infrastructure, summary.`;
 
-  const response = await ai.models.generateContent({
-    model: "gemini-1.5-flash-latest",
+  const response = await generateContentWithModelFallback((model) => ({
+    model,
     contents: prompt,
     config: {
       responseMimeType: "application/json",
@@ -261,7 +308,7 @@ Return JSON keys: city, sector, overallScore, label, breakdown, infrastructure, 
       candidateCount: 1,
       seed: stableSeed(`analysis::${key}`),
     },
-  });
+  }));
 
   const parsed = JSON.parse(response.text || "{}");
   return normalizeAnalysis(parsed, city, sector);

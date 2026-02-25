@@ -1,5 +1,5 @@
 import { GoogleGenAI, Type } from "@google/genai";
-import { LocationAnalysis } from "../types";
+import { InfrastructureItem, LocationAnalysis } from "../types";
 
 // Deterministic cache for analysis results
 const analysisCache = new Map<string, LocationAnalysis>();
@@ -11,7 +11,7 @@ type PersistentEntry<T> = {
   savedAt: number;
 };
 
-const ANALYSIS_CACHE_KEY = "mpf:analysis-cache:v1";
+const ANALYSIS_CACHE_KEY = "mpf:analysis-cache:v3";
 const MATCHES_CACHE_KEY = "mpf:matches-cache:v1";
 const VALIDATION_CACHE_KEY = "mpf:validation-cache:v1";
 const DEFAULT_CACHE_DAYS = 30;
@@ -25,6 +25,13 @@ const isBrowser = () => typeof window !== "undefined" && !!window.localStorage;
 
 const getCacheKey = (city: string, sector: string) =>
   `${(city || "").trim().toLowerCase()}::${(sector || "").trim().toLowerCase()}`;
+const MODEL_CANDIDATES = [
+  (import.meta as any)?.env?.VITE_GEMINI_MODEL,
+  "gemini-flash-latest",
+  "gemini-2.5-flash",
+  "gemini-2.0-flash",
+  "gemini-1.5-flash-latest",
+].filter(Boolean) as string[];
 
 const stableSeed = (input: string): number => {
   // FNV-1a 32-bit hash for deterministic seeds from user input.
@@ -33,7 +40,30 @@ const stableSeed = (input: string): number => {
     hash ^= input.charCodeAt(i);
     hash = Math.imul(hash, 16777619);
   }
-  return hash >>> 0;
+  // Gemini API expects signed int32 for seed.
+  return (hash >>> 0) % 2147483647;
+};
+
+const generateContentWithModelFallback = async (
+  ai: GoogleGenAI,
+  buildRequest: (model: string) => Parameters<typeof ai.models.generateContent>[0],
+) => {
+  let lastError: unknown = null;
+
+  for (const model of MODEL_CANDIDATES) {
+    try {
+      return await ai.models.generateContent(buildRequest(model));
+    } catch (error: any) {
+      const message = String(error?.message || "");
+      const isModelNotFound = message.includes("not found") || message.includes("NOT_FOUND");
+      if (!isModelNotFound) {
+        throw error;
+      }
+      lastError = error;
+    }
+  }
+
+  throw lastError || new Error("No compatible Gemini model found.");
 };
 
 const loadPersistentMap = <T>(storageKey: string): Map<string, PersistentEntry<T>> => {
@@ -81,33 +111,28 @@ const computeLabel = (overallScore: number): LocationAnalysis["label"] => {
 };
 
 const clampScore = (value: number): number => Math.max(0, Math.min(100, Number(value) || 0));
-const MIN_INFRASTRUCTURE_POINTS = 5;
+const ACCURATE_LANDMARK_DATA_UNAVAILABLE =
+  "Accurate landmark data not available for this exact location.";
 
-const ensureMinimumInfrastructure = (
-  input: Array<{ name: string; category: string; distance: number }>,
-  city: string,
-  sector: string,
-) => {
-  const items = [...input];
-  const seen = new Set(items.map((item) => item.name.toLowerCase()));
+const normalizeCategory = (value: string): InfrastructureItem["category"] => {
+  const v = (value || "").trim().toLowerCase();
+  if (v === "metro") return "Metro";
+  if (v === "hospital") return "Hospital";
+  if (v === "school") return "School";
+  if (v === "mall") return "Mall";
+  if (v === "park") return "Park";
+  return "Office";
+};
 
-  const fallbacks = [
-    { name: `${sector} Metro Station`, category: "Metro", distance: 0.9 },
-    { name: `${city} Multi-Speciality Hospital`, category: "Hospital", distance: 1.8 },
-    { name: `${sector} Public School`, category: "School", distance: 1.4 },
-    { name: `${city} Central Mall`, category: "Mall", distance: 2.6 },
-    { name: `${city} Tech Park`, category: "Office", distance: 3.2 },
-  ];
-
-  for (const fallback of fallbacks) {
-    if (items.length >= MIN_INFRASTRUCTURE_POINTS) break;
-    const key = fallback.name.toLowerCase();
-    if (seen.has(key)) continue;
-    items.push(fallback);
-    seen.add(key);
-  }
-
-  return items;
+const isGenericLandmarkName = (name: string): boolean => {
+  const normalized = (name || "").trim().toLowerCase();
+  if (!normalized) return true;
+  return [
+    "express link metro",
+    "city wellness center",
+    "global international school",
+    "unnamed infrastructure",
+  ].includes(normalized);
 };
 
 const normalizeAnalysis = (
@@ -132,14 +157,15 @@ const normalizeAnalysis = (
 
   const overallScore = Math.round(clampScore(weightedOverall) * 10) / 10;
 
-  const infrastructure = ensureMinimumInfrastructure((raw.infrastructure || [])
+  const infrastructure = (raw.infrastructure || [])
     .map((item) => ({
-      name: item?.name || "Unnamed Infrastructure",
-      category: item?.category || "Metro",
+      name: (item?.name || "").trim(),
+      category: normalizeCategory(item?.category || ""),
       distance: Math.round(Math.max(0, Number(item?.distance) || 0) * 100) / 100,
     }))
+    .filter((item) => Boolean(item.name) && !isGenericLandmarkName(item.name))
     .sort((a, b) => a.distance - b.distance || a.name.localeCompare(b.name))
-    .slice(0, 8), city || "City", sector || "Locality");
+    .slice(0, 8);
 
   return {
     city: raw.city || city || "Unknown Indian City",
@@ -149,8 +175,10 @@ const normalizeAnalysis = (
     breakdown,
     infrastructure,
     summary:
-      raw.summary ||
-      "This Indian location demonstrates strong appreciation potential driven by connectivity, services, and employment access.",
+      infrastructure.length === 0
+        ? ACCURATE_LANDMARK_DATA_UNAVAILABLE
+        : (raw.summary ||
+          "This Indian location demonstrates strong appreciation potential driven by connectivity, services, and employment access."),
   };
 };
 
@@ -254,8 +282,8 @@ export const validateLocationInput = async (
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
   try {
-    const response = await ai.models.generateContent({
-      model: "gemini-1.5-flash-latest",
+    const response = await generateContentWithModelFallback(ai, (model) => ({
+      model,
       contents: `Validate this user input for an INDIA real-estate query.
       City: "${city}"
       Locality: "${sector}"
@@ -273,7 +301,7 @@ export const validateLocationInput = async (
         candidateCount: 1,
         seed: stableSeed(`validate::${cacheKey}`),
       },
-    });
+    }));
 
     const parsed = JSON.parse(response.text || '{"isValid": true, "reason": "Valid input"}') as {
       isValid: boolean;
@@ -314,8 +342,8 @@ export const getCityMatches = async (city: string, sector: string): Promise<{ is
   const query = `${sector} ${city}`.trim();
 
   try {
-    const response = await ai.models.generateContent({
-      model: "gemini-1.5-flash-latest",
+    const response = await generateContentWithModelFallback(ai, (model) => ({
+      model,
       contents: `Determine if the location "${query}" is ambiguous within INDIA. 
       CRITICAL: You must ONLY consider cities and locations within INDIA. Ignore all international locations (e.g., ignore Delhi in USA/Canada).
       If "${query}" exists in multiple Indian cities (e.g. "Sector 15" exists in Noida, Gurgaon, Chandigarh), return isAmbiguous: true and list the relevant INDIAN cities. 
@@ -329,7 +357,7 @@ export const getCityMatches = async (city: string, sector: string): Promise<{ is
           candidateCount: 1,
           seed: stableSeed(`match::${cacheKey}`),
       },
-    });
+    }));
 
     const parsed = JSON.parse(response.text || '{"isAmbiguous": false, "suggestedCities": []}');
     matchesCache.set(cacheKey, parsed);
@@ -369,8 +397,8 @@ export const analyzeLocation = async (city: string, sector: string): Promise<Loc
   }
 
  try {
-  const response = await ai.models.generateContent({
-    model: "gemini-1.5-flash-latest",
+  const response = await generateContentWithModelFallback(ai, (model) => ({
+    model,
     contents: `Perform a detailed real-estate Market Potential Factor (MPF) analysis for ${queryContext}.
       
       STRICT REQUIREMENT: This platform is exclusively for the INDIAN real estate market. 
@@ -402,7 +430,7 @@ export const analyzeLocation = async (city: string, sector: string): Promise<Loc
         candidateCount: 1,
         seed: stableSeed(`analysis::${cacheKey}`),
     },
-  });
+  }));
 
     const result = normalizeAnalysis(JSON.parse(response.text || '{}') as Partial<LocationAnalysis>, city, sector);
     analysisCache.set(cacheKey, result);
@@ -423,12 +451,8 @@ export const analyzeLocation = async (city: string, sector: string): Promise<Loc
         retail: 82,
         employment: 90
       },
-      infrastructure: [
-        { name: `Express Link Metro`, category: 'Metro', distance: 0.8 },
-        { name: 'City Wellness Center', category: 'Hospital', distance: 2.1 },
-        { name: 'Global International School', category: 'School', distance: 1.5 },
-      ],
-      summary: "This Indian location demonstrates exceptional appreciation velocity driven by robust infrastructure pipeline and strategic proximity to major hubs."
+      infrastructure: [],
+      summary: ACCURATE_LANDMARK_DATA_UNAVAILABLE
     }, city, sector);
     analysisCache.set(cacheKey, fallback);
     persistentAnalysisCache.set(cacheKey, { value: fallback, savedAt: Date.now() });
