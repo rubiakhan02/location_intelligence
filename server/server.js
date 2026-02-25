@@ -150,10 +150,10 @@ const normalizeAnalysis = (raw, city, sector) => {
     Math.round(
       clampScore(
         breakdown.connectivity * 0.25 +
-          breakdown.healthcare * 0.15 +
-          breakdown.education * 0.15 +
-          breakdown.retail * 0.15 +
-          breakdown.employment * 0.15,
+        breakdown.healthcare * 0.15 +
+        breakdown.education * 0.15 +
+        breakdown.retail * 0.15 +
+        breakdown.employment * 0.15,
       ) * 10,
     ) / 10;
 
@@ -188,7 +188,7 @@ const validateInput = async (city, sector, key) => {
 
   try {
     const response = await ai.models.generateContent({
-      model: "gemini-1.5-flash",
+      model: "gemini-1.5-flash-latest",
       contents: `Validate this INDIA real-estate input.
 City: "${city}"
 Locality: "${sector}"
@@ -223,7 +223,7 @@ const detectAmbiguity = async (city, sector, key) => {
 
   const query = `${sector} ${city}`.trim();
   const response = await ai.models.generateContent({
-    model: "gemini-1.5-flash",
+    model: "gemini-1.5-flash-latest",
     contents: `Determine if "${query}" is ambiguous within INDIA only.
 If this locality can refer to multiple Indian cities, return isAmbiguous true with suggestedCities.
 If specific enough, return isAmbiguous false.`,
@@ -250,7 +250,7 @@ Scoring: 0-100 for connectivity, healthcare, education, retail, employment.
 Return JSON keys: city, sector, overallScore, label, breakdown, infrastructure, summary.`;
 
   const response = await ai.models.generateContent({
-    model: "gemini-1.5-flash",
+    model: "gemini-1.5-flash-latest",
     contents: prompt,
     config: {
       responseMimeType: "application/json",
@@ -389,5 +389,5 @@ app.get("/api/reply/:id", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-console.log(`API server listening on port ${PORT}`);
+  console.log(`API server listening on port ${PORT}`);
 });

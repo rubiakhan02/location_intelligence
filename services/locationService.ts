@@ -255,7 +255,7 @@ export const validateLocationInput = async (
 
   try {
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+      model: "gemini-1.5-flash-latest",
       contents: `Validate this user input for an INDIA real-estate query.
       City: "${city}"
       Locality: "${sector}"
@@ -315,7 +315,7 @@ export const getCityMatches = async (city: string, sector: string): Promise<{ is
 
   try {
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+      model: "gemini-1.5-flash-latest",
       contents: `Determine if the location "${query}" is ambiguous within INDIA. 
       CRITICAL: You must ONLY consider cities and locations within INDIA. Ignore all international locations (e.g., ignore Delhi in USA/Canada).
       If "${query}" exists in multiple Indian cities (e.g. "Sector 15" exists in Noida, Gurgaon, Chandigarh), return isAmbiguous: true and list the relevant INDIAN cities. 
@@ -370,7 +370,7 @@ export const analyzeLocation = async (city: string, sector: string): Promise<Loc
 
  try {
   const response = await ai.models.generateContent({
-    model: "gemini-2.5-flash",
+    model: "gemini-1.5-flash-latest",
     contents: `Perform a detailed real-estate Market Potential Factor (MPF) analysis for ${queryContext}.
       
       STRICT REQUIREMENT: This platform is exclusively for the INDIAN real estate market. 
