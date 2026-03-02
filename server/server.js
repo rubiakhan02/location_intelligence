@@ -18,10 +18,10 @@ const PORT = process.env.PORT || 4000;
 const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
 const MODEL_CANDIDATES = [
   process.env.GEMINI_MODEL,
-  "gemini-flash-latest",
-  "gemini-2.5-flash",
   "gemini-2.0-flash",
+  "gemini-flash-latest",
   "gemini-1.5-flash-latest",
+  "gemini-2.5-flash",
 ].filter(Boolean);
 const ai = apiKey ? new GoogleGenAI({ apiKey }) : null;
 
@@ -31,42 +31,119 @@ if (ai) {
   console.log("No API key provided; running with fallback responses");
 }
 
-const store = new Map(); // id -> request state
-const inputKeyMap = new Map(); // normalized input key -> id
+const store = new Map();
+const inputKeyMap = new Map();
 
-const RESPONSE_SCHEMA = {
+const CATEGORY_CONFIG = {
+  L: {
+    name: "Local Economy & Indicators",
+    maxScore: 200,
+    sections: ["Overview", "Jobs & Diversification", "Population & Urbanisation"],
+  },
+  O: {
+    name: "Ongoing / Future Projects",
+    maxScore: 150,
+    sections: ["Catalysts"],
+  },
+  C: {
+    name: "Connectivity & Commute",
+    maxScore: 150,
+    sections: ["Intra-City Connectivity", "Regional Connectivity"],
+  },
+  A: {
+    name: "Amenities & Gentrification",
+    maxScore: 150,
+    sections: ["Lifestyle", "Social Infra", "Gentrification"],
+  },
+  T: {
+    name: "Trends & Historical Data",
+    maxScore: 150,
+    sections: ["Prices & Yields", "Market Behaviour"],
+  },
+  E: {
+    name: "Existing Supply vs Demand",
+    maxScore: 200,
+    sections: ["Supply", "Demand", "Absorption"],
+  },
+};
+
+const CATEGORY_ORDER = ["L", "O", "C", "A", "T", "E"];
+
+const MODEL_REPORT_SCHEMA = {
   type: Type.OBJECT,
   properties: {
-    city: { type: Type.STRING },
-    sector: { type: Type.STRING },
-    overallScore: { type: Type.NUMBER },
-    label: { type: Type.STRING },
-    breakdown: {
-      type: Type.OBJECT,
-      properties: {
-        connectivity: { type: Type.NUMBER },
-        healthcare: { type: Type.NUMBER },
-        education: { type: Type.NUMBER },
-        retail: { type: Type.NUMBER },
-        employment: { type: Type.NUMBER },
+    cityName: { type: Type.STRING },
+    altName: { type: Type.STRING },
+    state: { type: Type.STRING },
+    focus: { type: Type.STRING },
+    categories: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          code: { type: Type.STRING },
+          name: { type: Type.STRING },
+          score: { type: Type.NUMBER },
+          sections: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                title: { type: Type.STRING },
+                body: { type: Type.STRING },
+              },
+              required: ["title", "body"],
+            },
+          },
+        },
+        required: ["code", "score", "sections"],
       },
-      required: ["connectivity", "healthcare", "education", "retail", "employment"],
     },
-    infrastructure: {
+    headlineVerdict: { type: Type.STRING },
+    nearbyLandmarks: {
       type: Type.ARRAY,
       items: {
         type: Type.OBJECT,
         properties: {
           name: { type: Type.STRING },
           category: { type: Type.STRING },
-          distance: { type: Type.NUMBER },
+          distanceKm: { type: Type.NUMBER },
         },
-        required: ["name", "category", "distance"],
+        required: ["name", "category", "distanceKm"],
       },
     },
-    summary: { type: Type.STRING },
+    interpretation: {
+      type: Type.OBJECT,
+      properties: {
+        strengths: { type: Type.ARRAY, items: { type: Type.STRING } },
+        watchOuts: { type: Type.ARRAY, items: { type: Type.STRING } },
+      },
+      required: ["strengths", "watchOuts"],
+    },
+    recommendations: {
+      type: Type.OBJECT,
+      properties: {
+        microMarketStrategy: { type: Type.ARRAY, items: { type: Type.STRING } },
+        developerAndInfra: { type: Type.ARRAY, items: { type: Type.STRING } },
+        assetType: { type: Type.ARRAY, items: { type: Type.STRING } },
+        holdingHorizon: { type: Type.STRING },
+      },
+      required: ["microMarketStrategy", "developerAndInfra", "assetType", "holdingHorizon"],
+    },
+    verdictText: { type: Type.STRING },
   },
-  required: ["city", "sector", "overallScore", "label", "breakdown", "infrastructure", "summary"],
+  required: [
+    "cityName",
+    "altName",
+    "state",
+    "focus",
+    "categories",
+    "headlineVerdict",
+    "nearbyLandmarks",
+    "interpretation",
+    "recommendations",
+    "verdictText",
+  ],
 };
 
 const MATCH_SCHEMA = {
@@ -87,9 +164,34 @@ const VALIDATION_SCHEMA = {
   required: ["isValid", "reason"],
 };
 
+const LANDMARK_VERIFICATION_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    nearbyLandmarks: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          name: { type: Type.STRING },
+          category: { type: Type.STRING },
+          distanceKm: { type: Type.NUMBER },
+        },
+        required: ["name", "category", "distanceKm"],
+      },
+    },
+  },
+  required: ["nearbyLandmarks"],
+};
+
 const normalize = (value) => (value || "").trim();
-const getInputKey = (city, sector) =>
-  `${normalize(city).toLowerCase()}::${normalize(sector).toLowerCase()}`;
+const getInputKey = (city, locality) =>
+  `${normalize(city).toLowerCase()}::${normalize(locality).toLowerCase()}`;
+
+const slugifyCity = (value) =>
+  normalize(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "unknown-city";
 
 const stableSeed = (input) => {
   let hash = 2166136261;
@@ -98,6 +200,11 @@ const stableSeed = (input) => {
     hash = Math.imul(hash, 16777619);
   }
   return (hash >>> 0) % 2147483647;
+};
+
+const seededInt = (seedObj, min, max) => {
+  seedObj.value = (seedObj.value * 48271) % 2147483647;
+  return min + (seedObj.value % (max - min + 1));
 };
 
 const generateContentWithModelFallback = async (buildRequest) => {
@@ -119,29 +226,269 @@ const generateContentWithModelFallback = async (buildRequest) => {
   throw lastError || new Error("No compatible Gemini model found.");
 };
 
-const clampScore = (value) => Math.max(0, Math.min(100, Number(value) || 0));
-const ACCURATE_LANDMARK_DATA_UNAVAILABLE =
-  "Accurate landmark data not available for this exact location.";
+const clampByMax = (value, max) => Math.max(0, Math.min(max, Number(value) || 0));
 
-const normalizeCategory = (value) => {
-  const v = (value || "").trim().toLowerCase();
-  if (v === "metro") return "Metro";
-  if (v === "hospital") return "Hospital";
-  if (v === "school") return "School";
-  if (v === "mall") return "Mall";
-  if (v === "park") return "Park";
-  return "Office";
+const buildGrade = (totalScore) => {
+  if (totalScore >= 900) return { grade: "A+", gradeLabel: "Excellent" };
+  if (totalScore >= 850) return { grade: "A", gradeLabel: "Excellent" };
+  if (totalScore >= 800) return { grade: "B+", gradeLabel: "Very Strong" };
+  if (totalScore >= 750) return { grade: "B", gradeLabel: "Strong" };
+  if (totalScore >= 700) return { grade: "C+", gradeLabel: "Stable" };
+  if (totalScore >= 650) return { grade: "C", gradeLabel: "Moderate" };
+  return { grade: "D", gradeLabel: "Weak" };
 };
 
-const isGenericLandmarkName = (name) => {
-  const normalized = (name || "").trim().toLowerCase();
-  if (!normalized) return true;
+const getDefaultBody = (title, city, locality) => {
+  if (title === "Overview") return `${locality} in ${city} has locality-level demand linked to city economic fundamentals.`;
+  if (title === "Jobs & Diversification") return `Employment catchments near ${locality} support residential and rental demand with sector diversification.`;
+  if (title === "Population & Urbanisation") return `Household formation and migration into ${locality} remain key to sustained absorption.`;
+  if (title === "Catalysts") return `Mobility, civic, and commercial projects around ${locality} can improve long-run value if delivered on time.`;
+  if (title === "Intra-City Connectivity") return `${locality} has functional city access, though peak-hour congestion can affect commute reliability.`;
+  if (title === "Regional Connectivity") return `Regional links through highways, rail, and airport access shape the locality's market depth.`;
+  if (title === "Lifestyle") return `Retail, food, and daily-needs ecosystems around ${locality} support end-user livability.`;
+  if (title === "Social Infra") return `Schools and hospitals in and around ${locality} influence family-led housing preference.`;
+  if (title === "Gentrification") return `${locality} is in an evolving urbanization cycle with selective premiumization.`;
+  if (title === "Prices & Yields") return `Price growth and rental yields in ${locality} indicate a balance between capital upside and income performance.`;
+  if (title === "Market Behaviour") return `Demand resilience in ${locality} is strongest in well-connected and correctly priced sub-markets.`;
+  if (title === "Supply") return `Pipeline supply in ${locality} should be monitored for timing and segment concentration.`;
+  if (title === "Demand") return `End-user and tenant interest in ${locality} depends on jobs access, livability, and affordability.`;
+  if (title === "Absorption") return `Absorption in ${locality} is strongest where pricing, location, and delivery quality align.`;
+  return `${locality} in ${city} shows relevant locality-level dynamics.`;
+};
+
+const normalizeSections = (rawSections, sectionTitles, city, locality) => {
+  const safeSections = Array.isArray(rawSections) ? rawSections : [];
+
+  return sectionTitles.map((title, index) => {
+    const byTitle = safeSections.find(
+      (s) => normalize(s?.title).toLowerCase() === title.toLowerCase(),
+    );
+    const byIndex = safeSections[index];
+    const source = byTitle || byIndex || {};
+    const body = normalize(source.body) || getDefaultBody(title, city, locality);
+
+    return { title, body };
+  });
+};
+
+const normalizeStringArray = (input, fallbackItem) => {
+  const arr = Array.isArray(input) ? input : [];
+  const cleaned = arr.map((x) => normalize(String(x || ""))).filter(Boolean);
+  return cleaned.length > 0 ? cleaned : [fallbackItem];
+};
+
+const normalizeLandmarkCategory = (value) => {
+  const v = normalize(value).toLowerCase();
+  if (v.includes("mall")) return "Mall";
+  if (v.includes("university") || v.includes("college")) return "University";
+  if (v.includes("metro")) return "Metro Station";
+  if (v.includes("hospital")) return "Hospital";
+  if (v.includes("airport")) return "Airport";
+  if (v.includes("school")) return "School";
+  if (v.includes("park")) return "Park";
+  if (v.includes("rail")) return "Railway Station";
+  if (v.includes("it") || v.includes("tech")) return "IT Park";
+  return "";
+};
+
+const isLowConfidenceLandmark = (name) => {
+  const n = normalize(name).toLowerCase();
+  if (!n) return true;
   return [
-    "express link metro",
-    "city wellness center",
-    "global international school",
-    "unnamed infrastructure",
-  ].includes(normalized);
+    "famous mall",
+    "local university",
+    "nearest metro station",
+    "city hospital",
+    "major airport",
+    "public school",
+    "central park",
+    "unknown landmark",
+    "unnamed landmark",
+  ].includes(n);
+};
+
+const normalizeNearbyLandmarks = (input) => {
+  const arr = Array.isArray(input) ? input : [];
+  return arr
+    .map((item) => {
+      const name = normalize(item?.name);
+      const category = normalizeLandmarkCategory(item?.category);
+      const distanceKm = Math.round(Math.max(0, Number(item?.distanceKm) || 0) * 100) / 100;
+      return { name, category, distanceKm };
+    })
+    .filter((item) => item.name && item.category && !isLowConfidenceLandmark(item.name))
+    .sort((a, b) => a.distanceKm - b.distanceKm || a.name.localeCompare(b.name))
+    .slice(0, 10);
+};
+
+const verifyNearbyLandmarks = async (city, locality, landmarks, key) => {
+  const cleaned = normalizeNearbyLandmarks(landmarks);
+  if (!ai || cleaned.length === 0) return cleaned;
+
+  try {
+    const response = await generateContentWithModelFallback((model) => ({
+      model,
+      contents: `Validate this landmark list for locality accuracy.\nCity: "${city}"\nLocality: "${locality}"\nCandidate landmarks JSON: ${JSON.stringify(cleaned)}\nRules:\n1. Keep only landmarks that are genuinely associated with this locality/city context.\n2. Remove doubtful, generic, wrongly located, or unverifiable landmarks.\n3. Keep the same schema with keys: name, category, distanceKm.\n4. If uncertain about all landmarks, return an empty nearbyLandmarks array.\n5. Do not invent new landmarks.`,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: LANDMARK_VERIFICATION_SCHEMA,
+        temperature: 0,
+        topP: 0,
+        topK: 1,
+        candidateCount: 1,
+        seed: stableSeed(`landmark-verify::${key}`),
+      },
+    }));
+
+    const parsed = JSON.parse(response.text || '{"nearbyLandmarks": []}');
+    return normalizeNearbyLandmarks(parsed?.nearbyLandmarks);
+  } catch (error) {
+    console.error("Landmark verification error:", error);
+    return cleaned;
+  }
+};
+
+const getCategoryRanges = () => ({
+  L: [115, 180],
+  O: [75, 135],
+  C: [80, 135],
+  A: [85, 140],
+  T: [80, 135],
+  E: [100, 175],
+});
+
+const fallbackLocateReport = (city, locality, key) => {
+  const seed = { value: stableSeed(`fallback::${key}`) || 137 };
+  const ranges = getCategoryRanges();
+
+  const categories = CATEGORY_ORDER.map((code) => {
+    const conf = CATEGORY_CONFIG[code];
+    const [min, max] = ranges[code];
+    const score = seededInt(seed, min, max);
+
+    return {
+      code,
+      name: conf.name,
+      maxScore: conf.maxScore,
+      score,
+      sections: conf.sections.map((title) => ({ title, body: getDefaultBody(title, city, locality) })),
+    };
+  });
+
+  const totalScore = categories.reduce((sum, item) => sum + item.score, 0);
+  const { grade, gradeLabel } = buildGrade(totalScore);
+
+  return {
+    id: 1,
+    cityId: slugifyCity(city),
+    cityName: city,
+    altName: "",
+    localityName: locality,
+    state: "Unknown",
+    focus: "Residential + rental demand driven by local jobs access and infrastructure trajectory",
+    evaluationDate: new Date().toISOString().slice(0, 10),
+    categories,
+    summary: {
+      totalScore,
+      maxTotalScore: 1000,
+      grade,
+      gradeLabel,
+      headlineVerdict: `${locality}, ${city} is a ${gradeLabel.toLowerCase()} micro-market with selective long-term potential.`,
+    },
+    nearbyLandmarks: [],
+    interpretation: {
+      strengths: [
+        `Demand in ${locality} benefits from proximity to employment catchments.`,
+        `Urban services and social infrastructure support end-user occupancy depth.`,
+        `Multiple price points allow strategy choice between yield and appreciation.`,
+      ],
+      watchOuts: [
+        "Infrastructure execution timing can delay expected value unlock.",
+        "Congestion and civic-service load can compress livability in peak periods.",
+        "Sub-market dispersion can create uneven performance across nearby pockets.",
+      ],
+    },
+    recommendations: {
+      microMarketStrategy: [
+        `Prioritize projects in ${locality} with proven delivery history and transport-linked positioning.`,
+      ],
+      developerAndInfra: [
+        "Prefer compliant developers and phase entry around on-ground infra completion, not announcements.",
+      ],
+      assetType: ["Mid-segment residential apartments with recurring rental demand."],
+      holdingHorizon: "5-7 years",
+    },
+    verdictText: `${locality} in ${city} offers viable long-horizon potential when entry pricing and micro-location are disciplined. The market is suitable for investors prioritizing steady compounding over speculative short-cycle flips.`,
+  };
+};
+
+const normalizeLocateReport = (raw, city, locality) => {
+  const categoriesByCode = new Map(
+    (Array.isArray(raw?.categories) ? raw.categories : []).map((cat) => [normalize(cat?.code).toUpperCase(), cat]),
+  );
+
+  const categories = CATEGORY_ORDER.map((code) => {
+    const conf = CATEGORY_CONFIG[code];
+    const rawCat = categoriesByCode.get(code) || {};
+    const score = Math.round(clampByMax(rawCat?.score, conf.maxScore));
+
+    return {
+      code,
+      name: conf.name,
+      maxScore: conf.maxScore,
+      score,
+      sections: normalizeSections(rawCat?.sections, conf.sections, city, locality),
+    };
+  });
+
+  const totalScore = categories.reduce((sum, item) => sum + item.score, 0);
+  const { grade, gradeLabel } = buildGrade(totalScore);
+
+  return {
+    id: 1,
+    cityId: slugifyCity(raw?.cityName || city),
+    cityName: normalize(raw?.cityName) || city,
+    altName: normalize(raw?.altName),
+    localityName: locality,
+    state: normalize(raw?.state) || "Unknown",
+    focus:
+      normalize(raw?.focus) ||
+      "Residential + commercial demand shaped by connectivity, jobs access, and social infrastructure",
+    evaluationDate: new Date().toISOString().slice(0, 10),
+    categories,
+    summary: {
+      totalScore,
+      maxTotalScore: 1000,
+      grade,
+      gradeLabel,
+      headlineVerdict:
+        normalize(raw?.headlineVerdict) ||
+        `${locality}, ${city} is a ${gradeLabel.toLowerCase()} micro-market with infrastructure-linked upside.`,
+    },
+    nearbyLandmarks: normalizeNearbyLandmarks(raw?.nearbyLandmarks),
+    interpretation: {
+      strengths: normalizeStringArray(raw?.interpretation?.strengths, "Structural demand from jobs and livability anchors supports this micro-market."),
+      watchOuts: normalizeStringArray(raw?.interpretation?.watchOuts, "Execution delays and localized oversupply remain key watchpoints."),
+    },
+    recommendations: {
+      microMarketStrategy: normalizeStringArray(
+        raw?.recommendations?.microMarketStrategy,
+        "Focus on transit-proximate, end-user driven pockets with demonstrated rental depth.",
+      ),
+      developerAndInfra: normalizeStringArray(
+        raw?.recommendations?.developerAndInfra,
+        "Select credible developers and align entry with tangible infra progress.",
+      ),
+      assetType: normalizeStringArray(
+        raw?.recommendations?.assetType,
+        "Mid-segment residential assets with stable tenant demand.",
+      ),
+      holdingHorizon: normalize(raw?.recommendations?.holdingHorizon) || "5-7 years",
+    },
+    verdictText:
+      normalize(raw?.verdictText) ||
+      `${locality} in ${city} has investable fundamentals, but returns will depend on asset quality, entry price, and infra execution.`,
+  };
 };
 
 const isObviouslyGibberish = (value) => {
@@ -158,76 +505,8 @@ const isObviouslyGibberish = (value) => {
   return false;
 };
 
-const fallbackAnalysis = (city, sector) => ({
-  city: city || "Unknown Indian City",
-  sector: sector || "General District",
-  overallScore: 88.5,
-  label: "High Growth",
-  breakdown: {
-    connectivity: 92,
-    healthcare: 85,
-    education: 88,
-    retail: 82,
-    employment: 90,
-  },
-  infrastructure: [],
-  summary: ACCURATE_LANDMARK_DATA_UNAVAILABLE,
-});
-
-const computeLabel = (overallScore) => {
-  if (overallScore >= 90) return "Excellent";
-  if (overallScore >= 82) return "High Growth";
-  if (overallScore >= 74) return "Good";
-  return "Emerging";
-};
-
-const normalizeAnalysis = (raw, city, sector) => {
-  const breakdown = {
-    connectivity: Math.round(clampScore(raw?.breakdown?.connectivity ?? 0) * 10) / 10,
-    healthcare: Math.round(clampScore(raw?.breakdown?.healthcare ?? 0) * 10) / 10,
-    education: Math.round(clampScore(raw?.breakdown?.education ?? 0) * 10) / 10,
-    retail: Math.round(clampScore(raw?.breakdown?.retail ?? 0) * 10) / 10,
-    employment: Math.round(clampScore(raw?.breakdown?.employment ?? 0) * 10) / 10,
-  };
-
-  const overallScore =
-    Math.round(
-      clampScore(
-        breakdown.connectivity * 0.25 +
-        breakdown.healthcare * 0.15 +
-        breakdown.education * 0.15 +
-        breakdown.retail * 0.15 +
-        breakdown.employment * 0.15,
-      ) * 10,
-    ) / 10;
-
-  const infrastructure = (raw?.infrastructure || [])
-    .map((item) => ({
-      name: (item?.name || "").trim(),
-      category: normalizeCategory(item?.category || ""),
-      distance: Math.round(Math.max(0, Number(item?.distance) || 0) * 100) / 100,
-    }))
-    .filter((item) => Boolean(item.name) && !isGenericLandmarkName(item.name))
-    .sort((a, b) => a.distance - b.distance || a.name.localeCompare(b.name))
-    .slice(0, 8);
-
-  return {
-    city: raw?.city || city,
-    sector: raw?.sector || sector,
-    overallScore,
-    label: computeLabel(overallScore),
-    breakdown,
-    infrastructure,
-    summary:
-      infrastructure.length === 0
-        ? ACCURATE_LANDMARK_DATA_UNAVAILABLE
-        : (raw?.summary ||
-          "This Indian location demonstrates strong appreciation potential driven by connectivity, services, and employment access."),
-  };
-};
-
-const validateInput = async (city, sector, key) => {
-  if (isObviouslyGibberish(city) || isObviouslyGibberish(sector)) {
+const validateInput = async (city, locality, key) => {
+  if (isObviouslyGibberish(city) || isObviouslyGibberish(locality)) {
     return { isValid: false, reason: "Invalid input. Enter a valid city and locality." };
   }
 
@@ -236,13 +515,7 @@ const validateInput = async (city, sector, key) => {
   try {
     const response = await generateContentWithModelFallback((model) => ({
       model,
-      contents: `Validate this INDIA real-estate input.
-City: "${city}"
-Locality: "${sector}"
-Rules:
-1. Accept minor spelling mistakes and typos.
-2. Reject only clear gibberish/random/non-place input.
-3. Return JSON only.`,
+      contents: `Validate this real-estate input.\nCity: "${city}"\nLocality: "${locality}"\nRules:\n1. Accept minor spelling mistakes and typos.\n2. Reject only clear gibberish/random/non-place input.\n3. Return JSON only.`,
       config: {
         responseMimeType: "application/json",
         responseSchema: VALIDATION_SCHEMA,
@@ -265,15 +538,13 @@ Rules:
   }
 };
 
-const detectAmbiguity = async (city, sector, key) => {
+const detectAmbiguity = async (city, locality, key) => {
   if (!ai) return { isAmbiguous: false, suggestedCities: [] };
 
-  const query = `${sector} ${city}`.trim();
+  const query = `${locality} ${city}`.trim();
   const response = await generateContentWithModelFallback((model) => ({
     model,
-    contents: `Determine if "${query}" is ambiguous within INDIA only.
-If this locality can refer to multiple Indian cities, return isAmbiguous true with suggestedCities.
-If specific enough, return isAmbiguous false.`,
+    contents: `Determine if "${query}" is ambiguous geographically. If this locality can refer to multiple cities, return isAmbiguous true with suggestedCities. If specific enough, return isAmbiguous false.`,
     config: {
       responseMimeType: "application/json",
       responseSchema: MATCH_SCHEMA,
@@ -288,20 +559,37 @@ If specific enough, return isAmbiguous false.`,
   return JSON.parse(response.text || '{"isAmbiguous": false, "suggestedCities": []}');
 };
 
-const analyze = async (city, sector, key) => {
-  if (!ai) return fallbackAnalysis(city, sector);
+const analyze = async (city, locality, key) => {
+  if (!ai) return fallbackLocateReport(city, locality, key);
 
-  const prompt = `Perform a detailed real-estate Market Potential Factor (MPF) analysis for Locality: ${sector}, City: ${city}, Country: INDIA.
-STRICT REQUIREMENT: only INDIA context.
-Scoring: 0-100 for connectivity, healthcare, education, retail, employment.
-Return JSON keys: city, sector, overallScore, label, breakdown, infrastructure, summary.`;
+  const prompt = `You are an urban economics and real-estate intelligence engine.
+Generate a LOCATE Score Report (out of 1000) for Locality: ${locality}, City: ${city}.
+Use realistic locality-level signals only; avoid fabricated mega projects.
+Category score limits:
+L max 200, O max 150, C max 150, A max 150, T max 150, E max 200.
+Return strictly valid JSON with keys:
+cityName, altName, state, focus, categories, headlineVerdict, nearbyLandmarks, interpretation, recommendations, verdictText.
+For categories include codes L,O,C,A,T,E with score and sections.
+Section titles must be:
+L: Overview, Jobs & Diversification, Population & Urbanisation
+O: Catalysts
+C: Intra-City Connectivity, Regional Connectivity
+A: Lifestyle, Social Infra, Gentrification
+T: Prices & Yields, Market Behaviour
+E: Supply, Demand, Absorption
+For nearbyLandmarks:
+- Return 6-10 real nearby landmarks for this exact locality only.
+- Prefer categories: Mall, University, Metro Station, Hospital, Airport, School, Park, Railway Station, IT Park.
+- Include distanceKm as realistic approximate road distance.
+- If uncertain about accuracy, return an empty array.
+Keep tone professional and investment-grade.`;
 
   const response = await generateContentWithModelFallback((model) => ({
     model,
     contents: prompt,
     config: {
       responseMimeType: "application/json",
-      responseSchema: RESPONSE_SCHEMA,
+      responseSchema: MODEL_REPORT_SCHEMA,
       temperature: 0,
       topP: 0,
       topK: 1,
@@ -311,13 +599,23 @@ Return JSON keys: city, sector, overallScore, label, breakdown, infrastructure, 
   }));
 
   const parsed = JSON.parse(response.text || "{}");
-  return normalizeAnalysis(parsed, city, sector);
+  parsed.nearbyLandmarks = await verifyNearbyLandmarks(
+    city,
+    locality,
+    parsed?.nearbyLandmarks,
+    key,
+  );
+  return normalizeLocateReport(parsed, city, locality);
 };
 
 const processRequest = async (item) => {
-  const key = getInputKey(item.city, item.sector);
+  const key = getInputKey(item.city, item.locality);
 
-  const validation = await validateInput(item.city, item.sector, key);
+  const [validation, ambiguity] = await Promise.all([
+    validateInput(item.city, item.locality, key),
+    detectAmbiguity(item.city, item.locality, key),
+  ]);
+
   if (!validation.isValid) {
     return {
       status: "invalid_input",
@@ -326,7 +624,6 @@ const processRequest = async (item) => {
     };
   }
 
-  const ambiguity = await detectAmbiguity(item.city, item.sector, key);
   if (ambiguity.isAmbiguous && Array.isArray(ambiguity.suggestedCities) && ambiguity.suggestedCities.length > 1) {
     return {
       status: "needs_clarification",
@@ -336,7 +633,7 @@ const processRequest = async (item) => {
     };
   }
 
-  const result = await analyze(item.city, item.sector, key);
+  const result = await analyze(item.city, item.locality, key);
   return { status: "done", result, error: null, suggestedCities: [] };
 };
 
@@ -351,16 +648,15 @@ app.get("/", (req, res) => {
   });
 });
 
-// Endpoint 1: Accept city + locality and issue deterministic request id.
 app.post("/api/input", (req, res) => {
   const city = normalize(req.body?.city);
-  const sector = normalize(req.body?.sector);
+  const locality = normalize(req.body?.locality ?? req.body?.sector);
 
-  if (!city || !sector) {
-    return res.status(400).json({ error: "Both city and sector are required." });
+  if (!city || !locality) {
+    return res.status(400).json({ error: "Both city and locality are required." });
   }
 
-  const key = getInputKey(city, sector);
+  const key = getInputKey(city, locality);
   if (inputKeyMap.has(key)) {
     const existingId = inputKeyMap.get(key);
     const existing = store.get(existingId);
@@ -372,7 +668,7 @@ app.post("/api/input", (req, res) => {
   store.set(id, {
     id,
     city,
-    sector,
+    locality,
     status: "pending",
     result: null,
     error: null,
@@ -382,7 +678,6 @@ app.post("/api/input", (req, res) => {
   return res.json({ id, status: "pending" });
 });
 
-// Endpoint 2: Returns computed result for id (or computes once and caches it).
 app.get("/api/reply/:id", async (req, res) => {
   const { id } = req.params;
   const item = store.get(id);
@@ -415,7 +710,7 @@ app.get("/api/reply/:id", async (req, res) => {
     });
   } catch (error) {
     console.error("Processing error:", error);
-    const fallback = fallbackAnalysis(item.city, item.sector);
+    const fallback = fallbackLocateReport(item.city, item.locality, getInputKey(item.city, item.locality));
     const updated = {
       ...item,
       status: "done",
