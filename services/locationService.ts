@@ -108,18 +108,35 @@ const toErrorMessage = (value: unknown) => {
 };
 
 const fetchJson = async <T>(path: string, options?: RequestInit): Promise<T> => {
-  const response = await fetch(`${API_BASE_URL}${path}`, options);
+  const url = `${API_BASE_URL}${path}`;
+  const response = await fetch(url, options);
+  const raw = await response.text();
+
+  const parseJson = (): any => {
+    if (!raw.trim()) {
+      throw new Error("API returned an empty response. Check Render API routing and VITE_API_BASE_URL.");
+    }
+    try {
+      return JSON.parse(raw);
+    } catch {
+      throw new Error("API returned a non-JSON response. Check Render API URL and backend deployment.");
+    }
+  };
+
   if (!response.ok) {
     let detail = "";
-    try {
-      const parsed = (await response.json()) as { error?: string };
-      detail = parsed?.error || "";
-    } catch {
-      detail = "";
+    if (raw.trim()) {
+      try {
+        const parsed = JSON.parse(raw) as { error?: string };
+        detail = parsed?.error || "";
+      } catch {
+        detail = raw.slice(0, 200);
+      }
     }
-    throw new Error(detail || `HTTP ${response.status}`);
+    throw new Error(detail || `HTTP ${response.status} for ${url}`);
   }
-  return (await response.json()) as T;
+
+  return parseJson() as T;
 };
 
 const isNotFoundError = (error: unknown): boolean => {
