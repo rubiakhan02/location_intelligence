@@ -18,10 +18,30 @@ const CACHE_TTL_DAYS = Math.max(
   Number((import.meta as any)?.env?.VITE_ANALYSIS_CACHE_TTL_DAYS || DEFAULT_CACHE_DAYS),
 );
 const CACHE_TTL_MS = CACHE_TTL_DAYS * 24 * 60 * 60 * 1000;
+const ENABLE_AMBIGUITY_CHECK = String((import.meta as any)?.env?.VITE_ENABLE_AMBIGUITY_CHECK || "false").toLowerCase() === "true";
 
-const API_BASE_URL =
-  ((import.meta as any)?.env?.VITE_API_BASE_URL as string | undefined)?.trim() ||
-  "http://localhost:4000";
+const trimTrailingSlash = (value: string) => value.replace(/\/+$/, "");
+
+const resolveApiBaseUrl = (): string => {
+  const isBrowserLocalHost =
+    typeof window !== "undefined" &&
+    (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
+
+  const explicitBase = ((import.meta as any)?.env?.VITE_API_BASE_URL as string | undefined)?.trim();
+  if (explicitBase) {
+    const normalized = trimTrailingSlash(explicitBase);
+    const pointsToLocalHost = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(normalized);
+    // Guard against broken production deployments that accidentally set localhost.
+    if (pointsToLocalHost && !isBrowserLocalHost) {
+      return "";
+    }
+    return normalized;
+  }
+
+  return "";
+};
+
+const API_BASE_URL = resolveApiBaseUrl();
 
 const isBrowser = () => typeof window !== "undefined" && !!window.localStorage;
 
@@ -102,6 +122,11 @@ const fetchJson = async <T>(path: string, options?: RequestInit): Promise<T> => 
   return (await response.json()) as T;
 };
 
+const isNotFoundError = (error: unknown): boolean => {
+  const message = toErrorMessage(error);
+  return message.includes("HTTP 404");
+};
+
 const pollReply = async (id: string): Promise<{
   status: "pending" | "done" | "invalid_input" | "needs_clarification";
   result: LocationAnalysis | null;
@@ -126,6 +151,32 @@ const pollReply = async (id: string): Promise<{
   }
 
   throw new Error("Analysis timed out. Please retry.");
+};
+
+const analyzeViaLegacyApi = async (
+  city: string,
+  locality: string,
+): Promise<{
+  id: string;
+  status: "done" | "invalid_input" | "needs_clarification";
+  result: LocationAnalysis | null;
+  error: string | null;
+  suggestedCities: string[];
+}> => {
+  const input = await fetchJson<{ id: string; status: string }>("/api/input", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ city, locality }),
+  });
+
+  const reply = await pollReply(input.id);
+  return {
+    id: input.id,
+    status: reply.status,
+    result: reply.result,
+    error: reply.error,
+    suggestedCities: reply.suggestedCities || [],
+  };
 };
 
 export const validateLocationInput = async (
@@ -158,6 +209,10 @@ export const getCityMatches = async (
   city: string,
   locality: string,
 ): Promise<{ isAmbiguous: boolean; suggestedCities: string[] }> => {
+  if (!ENABLE_AMBIGUITY_CHECK) {
+    return { isAmbiguous: false, suggestedCities: [] };
+  }
+
   const cacheKey = getCacheKey(city, locality);
   if (matchesCache.has(cacheKey)) {
     return matchesCache.get(cacheKey)!;
@@ -169,13 +224,29 @@ export const getCityMatches = async (
   }
 
   try {
-    const input = await fetchJson<{ id: string; status: string }>("/api/input", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ city, locality }),
-    });
-
-    const reply = await pollReply(input.id);
+    let reply: {
+      id: string;
+      status: "done" | "invalid_input" | "needs_clarification";
+      result: LocationAnalysis | null;
+      error: string | null;
+      suggestedCities: string[];
+    };
+    try {
+      reply = await fetchJson<{
+        id: string;
+        status: "done" | "invalid_input" | "needs_clarification";
+        result: LocationAnalysis | null;
+        error: string | null;
+        suggestedCities: string[];
+      }>("/api/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ city, locality }),
+      });
+    } catch (error) {
+      if (!isNotFoundError(error)) throw error;
+      reply = await analyzeViaLegacyApi(city, locality);
+    }
     const result = {
       isAmbiguous: reply.status === "needs_clarification",
       suggestedCities: reply.suggestedCities || [],
@@ -206,13 +277,29 @@ export const analyzeLocation = async (city: string, locality: string): Promise<L
   }
 
   try {
-    const input = await fetchJson<{ id: string; status: string }>("/api/input", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ city, locality }),
-    });
-
-    const reply = await pollReply(input.id);
+    let reply: {
+      id: string;
+      status: "done" | "invalid_input" | "needs_clarification";
+      result: LocationAnalysis | null;
+      error: string | null;
+      suggestedCities: string[];
+    };
+    try {
+      reply = await fetchJson<{
+        id: string;
+        status: "done" | "invalid_input" | "needs_clarification";
+        result: LocationAnalysis | null;
+        error: string | null;
+        suggestedCities: string[];
+      }>("/api/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ city, locality }),
+      });
+    } catch (error) {
+      if (!isNotFoundError(error)) throw error;
+      reply = await analyzeViaLegacyApi(city, locality);
+    }
 
     if (reply.status === "invalid_input") {
       throw new Error(reply.error || "Invalid input. Enter a valid city and locality.");

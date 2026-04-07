@@ -16,6 +16,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 4000;
 const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
+const FAST_RESPONSE_MODE = String(process.env.FAST_RESPONSE_MODE || "true").toLowerCase() !== "false";
 const MODEL_CANDIDATES = [
   process.env.GEMINI_MODEL,
   "gemini-2.0-flash",
@@ -30,6 +31,7 @@ if (ai) {
 } else {
   console.log("No API key provided; running with fallback responses");
 }
+console.log(`FAST_RESPONSE_MODE=${FAST_RESPONSE_MODE}`);
 
 const store = new Map();
 const inputKeyMap = new Map();
@@ -255,6 +257,7 @@ const getDefaultBody = (title, city, locality) => {
   if (title === "Absorption") return `Absorption in ${locality} is strongest where pricing, location, and delivery quality align.`;
   return `${locality} in ${city} shows relevant locality-level dynamics.`;
 };
+
 
 const normalizeSections = (rawSections, sectionTitles, city, locality) => {
   const safeSections = Array.isArray(rawSections) ? rawSections : [];
@@ -610,6 +613,18 @@ Keep tone professional and investment-grade.`;
 
 const processRequest = async (item) => {
   const key = getInputKey(item.city, item.locality);
+  if (FAST_RESPONSE_MODE) {
+    if (isObviouslyGibberish(item.city) || isObviouslyGibberish(item.locality)) {
+      return {
+        status: "invalid_input",
+        result: null,
+        error: "Invalid input. Enter a valid city and locality.",
+      };
+    }
+
+    const result = fallbackLocateReport(item.city, item.locality, key);
+    return { status: "done", result, error: null, suggestedCities: [] };
+  }
 
   const [validation, ambiguity] = await Promise.all([
     validateInput(item.city, item.locality, key),
@@ -637,6 +652,65 @@ const processRequest = async (item) => {
   return { status: "done", result, error: null, suggestedCities: [] };
 };
 
+app.post("/api/analyze", async (req, res) => {
+  const city = normalize(req.body?.city);
+  const locality = normalize(req.body?.locality ?? req.body?.sector);
+
+  if (!city || !locality) {
+    return res.status(400).json({ error: "Both city and locality are required." });
+  }
+
+  const key = getInputKey(city, locality);
+  const id = crypto.createHash("sha256").update(key).digest("hex");
+  const existing = store.get(id);
+  if (existing?.status === "done" || existing?.status === "invalid_input" || existing?.status === "needs_clarification") {
+    return res.json({
+      id,
+      status: existing.status,
+      result: existing.result,
+      error: existing.error,
+      suggestedCities: existing.suggestedCities || [],
+    });
+  }
+
+  const item = { id, city, locality, status: "pending", result: null, error: null, suggestedCities: [] };
+  store.set(id, item);
+  inputKeyMap.set(key, id);
+
+  try {
+    const processed = await processRequest(item);
+    const updated = { ...item, ...processed };
+    store.set(id, updated);
+
+    return res.json({
+      id,
+      status: updated.status,
+      result: updated.result,
+      error: updated.error,
+      suggestedCities: updated.suggestedCities || [],
+    });
+  } catch (error) {
+    console.error("Analyze endpoint error:", error);
+    const fallback = fallbackLocateReport(city, locality, key);
+    const updated = {
+      ...item,
+      status: "done",
+      result: fallback,
+      error: "Model unavailable. Returned fallback response.",
+      suggestedCities: [],
+    };
+    store.set(id, updated);
+
+    return res.json({
+      id,
+      status: updated.status,
+      result: updated.result,
+      error: updated.error,
+      suggestedCities: [],
+    });
+  }
+});
+
 app.get("/api/ping", (req, res) => {
   res.json({ ok: true, message: "pong" });
 });
@@ -644,7 +718,7 @@ app.get("/api/ping", (req, res) => {
 app.get("/", (req, res) => {
   res.json({
     message: "API server running",
-    endpoints: ["POST /api/input", "GET /api/reply/:id"],
+    endpoints: ["POST /api/analyze", "POST /api/input", "GET /api/reply/:id"],
   });
 });
 
