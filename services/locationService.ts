@@ -22,26 +22,51 @@ const ENABLE_AMBIGUITY_CHECK = String((import.meta as any)?.env?.VITE_ENABLE_AMB
 
 const trimTrailingSlash = (value: string) => value.replace(/\/+$/, "");
 
-const resolveApiBaseUrl = (): string => {
+const dedupe = (values: string[]) => Array.from(new Set(values.filter((v) => typeof v === "string")));
+
+const resolveOnRenderFallbackBase = (): string => {
+  if (typeof window === "undefined") return "";
+  const host = (window.location.hostname || "").toLowerCase();
+  if (!host.endsWith(".onrender.com")) return "";
+
+  const service = host.replace(/\.onrender\.com$/, "");
+  if (!service || service.endsWith("1")) return "";
+  return `https://${service}1.onrender.com`;
+};
+
+const resolveApiBaseCandidates = (): string[] => {
   const isBrowserLocalHost =
     typeof window !== "undefined" &&
     (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
 
+  const candidates: string[] = [];
   const explicitBase = ((import.meta as any)?.env?.VITE_API_BASE_URL as string | undefined)?.trim();
   if (explicitBase) {
     const normalized = trimTrailingSlash(explicitBase);
     const pointsToLocalHost = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(normalized);
     // Guard against broken production deployments that accidentally set localhost.
     if (pointsToLocalHost && !isBrowserLocalHost) {
-      return "";
+      candidates.push("");
+    } else {
+      candidates.push(normalized);
     }
-    return normalized;
   }
 
-  return "";
+  if (isBrowserLocalHost) {
+    candidates.push("http://localhost:4000");
+  }
+
+  // Same-origin works when frontend and backend are served by one service or a proxy.
+  candidates.push("");
+
+  // Render-specific fallback for split services, e.g. service + service1 naming.
+  const renderFallback = resolveOnRenderFallbackBase();
+  if (renderFallback) candidates.push(renderFallback);
+
+  return dedupe(candidates);
 };
 
-const API_BASE_URL = resolveApiBaseUrl();
+const API_BASE_CANDIDATES = resolveApiBaseCandidates();
 
 const isBrowser = () => typeof window !== "undefined" && !!window.localStorage;
 
@@ -108,35 +133,56 @@ const toErrorMessage = (value: unknown) => {
 };
 
 const fetchJson = async <T>(path: string, options?: RequestInit): Promise<T> => {
-  const url = `${API_BASE_URL}${path}`;
-  const response = await fetch(url, options);
-  const raw = await response.text();
+  const errors: string[] = [];
 
-  const parseJson = (): any => {
-    if (!raw.trim()) {
-      throw new Error("API returned an empty response. Check Render API routing and VITE_API_BASE_URL.");
-    }
+  for (const base of API_BASE_CANDIDATES) {
+    const url = `${base}${path}`;
     try {
-      return JSON.parse(raw);
-    } catch {
-      throw new Error("API returned a non-JSON response. Check Render API URL and backend deployment.");
-    }
-  };
+      const response = await fetch(url, options);
+      const raw = await response.text();
 
-  if (!response.ok) {
-    let detail = "";
-    if (raw.trim()) {
-      try {
-        const parsed = JSON.parse(raw) as { error?: string };
-        detail = parsed?.error || "";
-      } catch {
-        detail = raw.slice(0, 200);
+      if (!response.ok) {
+        let detail = "";
+        if (raw.trim()) {
+          try {
+            const parsed = JSON.parse(raw) as { error?: string };
+            detail = parsed?.error || "";
+          } catch {
+            detail = raw.slice(0, 200);
+          }
+        }
+        errors.push(detail || `HTTP ${response.status} for ${url}`);
+        continue;
       }
+
+      if (!raw.trim()) {
+        errors.push(`Empty response from ${url}`);
+        continue;
+      }
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        errors.push(`Non-JSON response from ${url}`);
+        continue;
+      }
+
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && Object.keys(parsed as object).length === 0) {
+        errors.push(`Empty JSON object from ${url}`);
+        continue;
+      }
+
+      return parsed as T;
+    } catch (error) {
+      errors.push(toErrorMessage(error));
     }
-    throw new Error(detail || `HTTP ${response.status} for ${url}`);
   }
 
-  return parseJson() as T;
+  throw new Error(
+    errors[errors.length - 1] ||
+      "API returned an empty response. Check Render API routing and VITE_API_BASE_URL.",
+  );
 };
 
 const isNotFoundError = (error: unknown): boolean => {
